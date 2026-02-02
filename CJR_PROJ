@@ -1,65 +1,74 @@
+# =============================================
+# FILE: Hybrid_SARIMAX_LSTM_SHAP
+# =============================================
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+import shap
 
+# ----------------------------
+# 1. Generate Complex Time Series
+# ----------------------------
 np.random.seed(42)
-
-# Time index (hourly data ~ 1 year)
-hours = 24 * 365
+hours = 24 * 365 * 2  # 2 years of hourly data
 time = pd.date_range(start="2022-01-01", periods=hours, freq="H")
 
 # Components
-trend = np.linspace(50, 80, hours)
-daily_seasonality = 10 * np.sin(2 * np.pi * time.hour / 24)
-weekly_seasonality = 5 * np.sin(2 * np.pi * time.dayofweek / 7)
+trend = np.linspace(50, 120, hours)
+daily_seasonality = 15 * np.sin(2 * np.pi * time.hour / 24)
+weekly_seasonality = 10 * np.sin(2 * np.pi * time.dayofweek / 7)
+yearly_seasonality = 5 * np.sin(2 * np.pi * time.dayofyear / 365)
 temperature = 15 + 10 * np.sin(2 * np.pi * time.dayofyear / 365) + np.random.normal(0, 2, hours)
+spikes = np.random.choice([0, 20, -15], size=hours, p=[0.97, 0.02, 0.01])
 noise = np.random.normal(0, 3, hours)
 
-load = trend + daily_seasonality + weekly_seasonality + 0.5 * temperature + noise
+load = trend + daily_seasonality + weekly_seasonality + yearly_seasonality + 0.5 * temperature + spikes + noise
 
 data = pd.DataFrame({
     "load": load,
     "temperature": temperature,
-    "hour": time.hour
+    "hour": time.hour,
+    "dayofweek": time.dayofweek
 }, index=time)
 
-# Lag feature
+# Lag features
 data["load_lag_1"] = data["load"].shift(1)
+data["load_lag_24"] = data["load"].shift(24)
 data.dropna(inplace=True)
 
-data.head()
-
 plt.figure(figsize=(12,4))
-plt.plot(data["load"])
-plt.title("Synthetic Electricity Load")
+plt.plot(data["load"][:1000])
+plt.title("Complex Synthetic Electricity Load")
 plt.show()
 
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-
-X = data[["temperature", "hour", "load_lag_1"]]
+# ----------------------------
+# 2. Train/Test Split
+# ----------------------------
+X = data[["temperature", "hour", "dayofweek", "load_lag_1", "load_lag_24"]]
 y = data["load"]
 
 initial_train_size = int(len(data) * 0.7)
-
 X_train_init = X.iloc[:initial_train_size]
 y_train_init = y.iloc[:initial_train_size]
-
 X_test = X.iloc[initial_train_size:]
 y_test = y.iloc[initial_train_size:]
 
-print("Train size:", len(X_train_init))
-print("Test size :", len(X_test))
+print("Train size:", len(X_train_init), "Test size:", len(X_test))
 
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-
-sarima_predictions = []
-sarima_actuals = []
-
+# ----------------------------
+# 3. Walk-forward SARIMAX
+# ----------------------------
+sarima_preds = []
 history_y = y_train_init.copy()
 history_X = X_train_init.copy()
 
-print("SARIMAX walk-forward started")
-
+print("SARIMAX walk-forward started...")
 for i in range(len(X_test)):
     model = SARIMAX(
         history_y,
@@ -70,37 +79,30 @@ for i in range(len(X_test)):
         enforce_invertibility=False
     )
     model_fit = model.fit(disp=False)
-
-    yhat = model_fit.forecast(
-        steps=1,
-        exog=X_test.iloc[i:i+1]
-    )[0]
-
-    sarima_predictions.append(yhat)
-    sarima_actuals.append(y_test.iloc[i])
-
+    
+    yhat = model_fit.forecast(steps=1, exog=X_test.iloc[i:i+1])[0]
+    sarima_preds.append(yhat)
+    
+    # Append actual for walk-forward
     history_y = pd.concat([history_y, y_test.iloc[i:i+1]])
     history_X = pd.concat([history_X, X_test.iloc[i:i+1]])
 
-print("SARIMAX completed")
+sarima_rmse = mean_squared_error(y_test, sarima_preds, squared=False)
+sarima_mae = mean_absolute_error(y_test, sarima_preds)
+print("SARIMAX RMSE:", sarima_rmse, "MAE:", sarima_mae)
 
-sarima_rmse = mean_squared_error(sarima_actuals, sarima_predictions, squared=False)
-sarima_mae = mean_absolute_error(sarima_actuals, sarima_predictions)
+# ----------------------------
+# 4. LSTM on Residuals (Hybrid)
+# ----------------------------
+residuals = y_test.values - np.array(sarima_preds)
 
-print("SARIMAX RMSE:", sarima_rmse)
-print("SARIMAX MAE :", sarima_mae)
-
-from sklearn.preprocessing import MinMaxScaler
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
-
+# Scaling
 scaler_X = MinMaxScaler()
 scaler_y = MinMaxScaler()
-
 X_scaled = scaler_X.fit_transform(X)
-y_scaled = scaler_y.fit_transform(y.values.reshape(-1,1))
+residuals_scaled = scaler_y.fit_transform(residuals.reshape(-1,1))
 
+# Sequence creation
 def create_sequences(X, y, seq_len=24):
     Xs, ys = [], []
     for i in range(seq_len, len(X)):
@@ -109,49 +111,66 @@ def create_sequences(X, y, seq_len=24):
     return np.array(Xs), np.array(ys)
 
 SEQ_LEN = 24
-X_seq, y_seq = create_sequences(X_scaled, y_scaled, SEQ_LEN)
+X_seq, y_seq = create_sequences(X_scaled, residuals_scaled, SEQ_LEN)
 
 split = int(0.7 * len(X_seq))
-X_train, X_test_lstm = X_seq[:split], X_seq[split:]
-y_train, y_test_lstm = y_seq[:split], y_seq[split:]
+X_train_lstm, X_test_lstm = X_seq[:split], X_seq[split:]
+y_train_lstm, y_test_lstm = y_seq[:split], y_seq[split:]
 
-
-model = Sequential([
-    LSTM(64, input_shape=(SEQ_LEN, X_train.shape[2])),
+model_lstm = Sequential([
+    LSTM(64, input_shape=(SEQ_LEN, X_train_lstm.shape[2])),
     Dense(1)
 ])
+model_lstm.compile(optimizer="adam", loss="mse")
+model_lstm.fit(X_train_lstm, y_train_lstm, epochs=10, batch_size=64, verbose=1)
 
-model.compile(optimizer="adam", loss="mse")
-model.fit(X_train, y_train, epochs=10, batch_size=64, verbose=1)
+lstm_preds_scaled = model_lstm.predict(X_test_lstm)
+lstm_preds = scaler_y.inverse_transform(lstm_preds_scaled)
 
-lstm_preds = model.predict(X_test_lstm)
-lstm_preds_inv = scaler_y.inverse_transform(lstm_preds)
-y_test_inv = scaler_y.inverse_transform(y_test_lstm)
+# Final hybrid prediction
+sarima_preds_hybrid = sarima_preds[-len(lstm_preds):] + lstm_preds.flatten()
+hybrid_rmse = mean_squared_error(y_test[-len(lstm_preds):], sarima_preds_hybrid, squared=False)
+hybrid_mae = mean_absolute_error(y_test[-len(lstm_preds):], sarima_preds_hybrid)
 
-lstm_rmse = mean_squared_error(y_test_inv, lstm_preds_inv, squared=False)
-lstm_mae = mean_absolute_error(y_test_inv, lstm_preds_inv)
+print("Hybrid SARIMAX + LSTM RMSE:", hybrid_rmse, "MAE:", hybrid_mae)
 
-print("LSTM RMSE:", lstm_rmse)
-print("LSTM MAE :", lstm_mae)
+# ----------------------------
+# 5. Forecast Comparison Plot
+# ----------------------------
+plt.figure(figsize=(15,5))
+plt.plot(y_test[-500:], label="Actual")
+plt.plot(sarima_preds[-500:], label="SARIMAX")
+plt.plot(sarima_preds_hybrid[-500:], label="Hybrid SARIMAX+LSTM")
+plt.legend()
+plt.title("Forecast Comparison (Last 500 hours)")
+plt.show()
 
-import shap
-
-background = X_train[:100]
-explainer = shap.DeepExplainer(model, background)
-
+# ----------------------------
+# 6. SHAP Analysis for LSTM Residuals
+# ----------------------------
+print("Running SHAP for LSTM...")
+# Use small background set for efficiency
+background = X_train_lstm[:100]
+explainer = shap.DeepExplainer(model_lstm, background)
 shap_values = explainer.shap_values(X_test_lstm[:200])
+
+# Feature names repeated for sequence length
+feature_names = ["temperature", "hour", "dayofweek", "load_lag_1", "load_lag_24"] * SEQ_LEN
 
 shap.summary_plot(
     shap_values[0],
     X_test_lstm[:200].reshape(200, -1),
-    feature_names=["temperature", "hour", "load_lag_1"] * SEQ_LEN
+    feature_names=feature_names
 )
 
+# ----------------------------
+# 7. Comparison Table
+# ----------------------------
 results = pd.DataFrame({
-    "Model": ["SARIMAX", "LSTM"],
-    "RMSE": [sarima_rmse, lstm_rmse],
-    "MAE": [sarima_mae, lstm_mae]
+    "Model": ["ARIMA (vanilla)", "SARIMAX", "Hybrid SARIMAX + LSTM"],
+    "RMSE": [np.nan, sarima_rmse, hybrid_rmse],
+    "MAE": [np.nan, sarima_mae, hybrid_mae]
 })
+print(results)
 
-results
 
