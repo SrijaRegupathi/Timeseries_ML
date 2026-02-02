@@ -2,290 +2,156 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-%matplotlib inline
-plt.rcParams["figure.figsize"] = (12, 5)
-
-# Create hourly time index (1 year)
-date_range = pd.date_range(
-    start="2023-01-01",
-    end="2023-12-31 23:00",
-    freq="h"
-)
-
-n = len(date_range)
-
 np.random.seed(42)
 
-# Trend (slow growth)
-trend = np.linspace(0, 50, n)
+# Time index (hourly data ~ 1 year)
+hours = 24 * 365
+time = pd.date_range(start="2022-01-01", periods=hours, freq="H")
 
-# Daily seasonality (24-hour cycle)
-daily_seasonality = 20 * np.sin(2 * np.pi * date_range.hour / 24)
+# Components
+trend = np.linspace(50, 80, hours)
+daily_seasonality = 10 * np.sin(2 * np.pi * time.hour / 24)
+weekly_seasonality = 5 * np.sin(2 * np.pi * time.dayofweek / 7)
+temperature = 15 + 10 * np.sin(2 * np.pi * time.dayofyear / 365) + np.random.normal(0, 2, hours)
+noise = np.random.normal(0, 3, hours)
 
-# Weekly seasonality (7-day cycle)
-weekly_seasonality = 15 * np.sin(2 * np.pi * date_range.dayofweek / 7)
+load = trend + daily_seasonality + weekly_seasonality + 0.5 * temperature + noise
 
-# Temperature (correlated, seasonal)
-temperature = (
-    25
-    + 10 * np.sin(2 * np.pi * date_range.dayofyear / 365)
-    + np.random.normal(0, 2, n)
-)
-
-# Noise
-noise = np.random.normal(0, 5, n)
-
-# Load (target variable)
-load = (
-    100
-    + trend
-    + daily_seasonality
-    + weekly_seasonality
-    + 0.5 * temperature
-    + noise
-)
 data = pd.DataFrame({
     "load": load,
     "temperature": temperature,
-    "hour": date_range.hour
-}, index=date_range)
+    "hour": time.hour
+}, index=time)
 
-# Lag feature (previous day load)
-data["load_lag_24"] = data["load"].shift(24)
-
-# Drop initial NaNs
+# Lag feature
+data["load_lag_1"] = data["load"].shift(1)
 data.dropna(inplace=True)
 
 data.head()
-plt.plot(data.index[:1000], data["load"][:1000])
-plt.title("Electricity Load (First 1000 Hours)")
-plt.xlabel("Time")
-plt.ylabel("Load")
-plt.grid(True)
+
+plt.figure(figsize=(12,4))
+plt.plot(data["load"])
+plt.title("Synthetic Electricity Load")
 plt.show()
 
-plt.scatter(data["temperature"][:500], data["load"][:500], alpha=0.5)
-plt.title("Load vs Temperature")
-plt.xlabel("Temperature")
-plt.ylabel("Load")
-plt.show()
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-# 1-hour lag of load
-data['load_lag_1'] = data['load'].shift(1)
+X = data[["temperature", "hour", "load_lag_1"]]
+y = data["load"]
 
-# Drop first row created by lag
-data = data.dropna().reset_index(drop=True)
+initial_train_size = int(len(data) * 0.7)
 
-print("Lag feature added successfully.")
-print(data.head())
+X_train_init = X.iloc[:initial_train_size]
+y_train_init = y.iloc[:initial_train_size]
 
-# =========================
-# STAGE 2 – WALK-FORWARD VALIDATION SETUP
-# =========================
+X_test = X.iloc[initial_train_size:]
+y_test = y.iloc[initial_train_size:]
 
-import matplotlib.pyplot as plt
-
-# -------------------------
-# 2.1 Feature–Target Split
-# -------------------------
-
-# Target variable
-y = data['load']
-
-# Feature set (multivariate)
-X = data[['temperature', 'hour', 'load_lag_1']]
-
-# -------------------------
-# 2.2 Initial Train/Test Split (70% / 30%)
-# -------------------------
-
-initial_train_size = 5000
-
-
-X_train_init = X.iloc[:initial_train_size].copy()
-y_train_init = y.iloc[:initial_train_size].copy()
-
-X_test = X.iloc[initial_train_size:].copy()
-y_test = y.iloc[initial_train_size:].copy()
-
-print("Initial training samples:", len(X_train_init))
-print("Testing samples:", len(X_test))
-
-# -------------------------
-# 2.3 Visualization (NO DATA LEAKAGE PROOF)
-# -------------------------
-
-plt.figure(figsize=(14,5))
-plt.plot(y_train_init.index, y_train_init, label="Training Data")
-plt.plot(y_test.index, y_test, label="Testing Data")
-plt.xlabel("Time")
-plt.ylabel("Load")
-plt.title("Walk-Forward Validation: Train / Test Split")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-# -------------------------
-# 2.4 Walk-Forward Containers
-# -------------------------
-
-# These will be updated step-by-step during forecasting
-history_X = X_train_init.copy()
-history_y = y_train_init.copy()
-
-print("Walk-forward history initialized.")
+print("Train size:", len(X_train_init))
+print("Test size :", len(X_test))
 
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from sklearn.metrics import mean_squared_error
-import numpy as np
-import matplotlib.pyplot as plt
 
-print("STAGE 3 STARTED — SARIMAX BASELINE")
+sarima_predictions = []
+sarima_actuals = []
 
-# -------------------------
-# Train SARIMAX ONCE
-# -------------------------
-sarima_model = SARIMAX(
-    y_train_init,
-    exog=X_train_init,
-    order=(1, 1, 1),
-    seasonal_order=(1, 1, 1, 24),
-    enforce_stationarity=False,
-    enforce_invertibility=False
-)
+history_y = y_train_init.copy()
+history_X = X_train_init.copy()
 
-sarima_fit = sarima_model.fit(disp=False)
+print("SARIMAX walk-forward started")
 
-print("Model training completed")
+for i in range(len(X_test)):
+    model = SARIMAX(
+        history_y,
+        exog=history_X,
+        order=(1,1,1),
+        seasonal_order=(1,1,1,24),
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
+    model_fit = model.fit(disp=False)
 
-# -------------------------
-# Forecast on test set
-# -------------------------
-sarima_forecast = sarima_fit.forecast(
-    steps=len(y_test),
-    exog=X_test
-)
+    yhat = model_fit.forecast(
+        steps=1,
+        exog=X_test.iloc[i:i+1]
+    )[0]
 
-# -------------------------
-# Evaluation
-# -------------------------
-rmse = np.sqrt(mean_squared_error(y_test, sarima_forecast))
-print("SARIMAX RMSE:", rmse)
+    sarima_predictions.append(yhat)
+    sarima_actuals.append(y_test.iloc[i])
 
-# -------------------------
-# Plot
-# -------------------------
-plt.figure(figsize=(12,5))
-plt.plot(y_test.values[:200], label="Actual", linewidth=2)
-plt.plot(sarima_forecast.values[:200], label="SARIMAX Forecast", linestyle="--")
-plt.title("SARIMAX Baseline Forecast vs Actual")
-plt.xlabel("Time Steps")
-plt.ylabel("Load")
-plt.legend()
-plt.show()
+    history_y = pd.concat([history_y, y_test.iloc[i:i+1]])
+    history_X = pd.concat([history_X, X_test.iloc[i:i+1]])
 
-print("STAGE 3 COMPLETED SUCCESSFULLY")
+print("SARIMAX completed")
 
-# =========================
-# STAGE 4: FOREST MODEL
-# =========================
+sarima_rmse = mean_squared_error(sarima_actuals, sarima_predictions, squared=False)
+sarima_mae = mean_absolute_error(sarima_actuals, sarima_predictions)
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+print("SARIMAX RMSE:", sarima_rmse)
+print("SARIMAX MAE :", sarima_mae)
 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-# Target variable
-y = data['load']
+from sklearn.preprocessing import MinMaxScaler
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
-# Multivariate feature set
-X = data[['temperature', 'hour', 'load_lag_1']]
-train_size = int(len(data) * 0.7)
+scaler_X = MinMaxScaler()
+scaler_y = MinMaxScaler()
 
-X_train = X.iloc[:train_size]
-y_train = y.iloc[:train_size]
+X_scaled = scaler_X.fit_transform(X)
+y_scaled = scaler_y.fit_transform(y.values.reshape(-1,1))
 
-X_test = X.iloc[train_size:]
-y_test = y.iloc[train_size:]
+def create_sequences(X, y, seq_len=24):
+    Xs, ys = [], []
+    for i in range(seq_len, len(X)):
+        Xs.append(X[i-seq_len:i])
+        ys.append(y[i])
+    return np.array(Xs), np.array(ys)
 
-print("Train size:", len(X_train))
-print("Test size :", len(X_test))
-rf_model = RandomForestRegressor(
-    n_estimators=200,
-    max_depth=10,
-    random_state=42,
-    n_jobs=-1
-)
+SEQ_LEN = 24
+X_seq, y_seq = create_sequences(X_scaled, y_scaled, SEQ_LEN)
 
-rf_model.fit(X_train, y_train)
-rf_predictions = rf_model.predict(X_test)
+split = int(0.7 * len(X_seq))
+X_train, X_test_lstm = X_seq[:split], X_seq[split:]
+y_train, y_test_lstm = y_seq[:split], y_seq[split:]
 
-rmse_rf = np.sqrt(mean_squared_error(y_test, rf_predictions))
-mae_rf = mean_absolute_error(y_test, rf_predictions)
 
-print("Random Forest RMSE:", rmse_rf)
-print("Random Forest MAE :", mae_rf)
-plt.figure(figsize=(12,5))
-plt.plot(y_test.values[:200], label="Actual Load", linewidth=2)
-plt.plot(rf_predictions[:200], label="RF Forecast", linestyle="--")
-plt.title("Random Forest Forecast vs Actual (First 200 Points)")
-plt.xlabel("Time Step")
-plt.ylabel("Electricity Load")
-plt.legend()
-plt.grid(True)
-plt.show()
+model = Sequential([
+    LSTM(64, input_shape=(SEQ_LEN, X_train.shape[2])),
+    Dense(1)
+])
 
-# =========================
-# STAGE 5: SHAP EXPLAINABILITY
-# =========================
+model.compile(optimizer="adam", loss="mse")
+model.fit(X_train, y_train, epochs=10, batch_size=64, verbose=1)
+
+lstm_preds = model.predict(X_test_lstm)
+lstm_preds_inv = scaler_y.inverse_transform(lstm_preds)
+y_test_inv = scaler_y.inverse_transform(y_test_lstm)
+
+lstm_rmse = mean_squared_error(y_test_inv, lstm_preds_inv, squared=False)
+lstm_mae = mean_absolute_error(y_test_inv, lstm_preds_inv)
+
+print("LSTM RMSE:", lstm_rmse)
+print("LSTM MAE :", lstm_mae)
 
 import shap
-import matplotlib.pyplot as plt
 
-# 1️⃣ Initialize SHAP (safe for Jupyter)
-shap.initjs()
+background = X_train[:100]
+explainer = shap.DeepExplainer(model, background)
 
-# 2️⃣ Create SHAP explainer for Random Forest
-explainer = shap.TreeExplainer(rf_model)
+shap_values = explainer.shap_values(X_test_lstm[:200])
 
-# 3️⃣ Calculate SHAP values on test data
-shap_values = explainer.shap_values(X_test)
-
-# =========================
-# 4️⃣ SHAP SUMMARY PLOT
-# =========================
-print("SHAP Summary Plot (Feature Importance)")
 shap.summary_plot(
-    shap_values,
-    X_test,
-    feature_names=X_test.columns,
-    show=True
+    shap_values[0],
+    X_test_lstm[:200].reshape(200, -1),
+    feature_names=["temperature", "hour", "load_lag_1"] * SEQ_LEN
 )
 
-# =========================
-# 5️⃣ SHAP BAR PLOT
-# =========================
-print("SHAP Bar Plot (Mean Absolute Impact)")
-shap.summary_plot(
-    shap_values,
-    X_test,
-    feature_names=X_test.columns,
-    plot_type="bar",
-    show=True
-)
+results = pd.DataFrame({
+    "Model": ["SARIMAX", "LSTM"],
+    "RMSE": [sarima_rmse, lstm_rmse],
+    "MAE": [sarima_mae, lstm_mae]
+})
 
-# =========================
-# 6️⃣ SINGLE PREDICTION EXPLANATION
-# =========================
-sample_index = 0
+results
 
-print("SHAP Force Plot for one prediction")
-shap.force_plot(
-    explainer.expected_value,
-    shap_values[sample_index],
-    X_test.iloc[sample_index],
-    matplotlib=True
-)
-
-plt.show()
