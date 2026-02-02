@@ -1,169 +1,291 @@
-%matplotlib inline
-
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+
+%matplotlib inline
+plt.rcParams["figure.figsize"] = (12, 5)
+
+# Create hourly time index (1 year)
+date_range = pd.date_range(
+    start="2023-01-01",
+    end="2023-12-31 23:00",
+    freq="h"
+)
+
+n = len(date_range)
+
+np.random.seed(42)
+
+# Trend (slow growth)
+trend = np.linspace(0, 50, n)
+
+# Daily seasonality (24-hour cycle)
+daily_seasonality = 20 * np.sin(2 * np.pi * date_range.hour / 24)
+
+# Weekly seasonality (7-day cycle)
+weekly_seasonality = 15 * np.sin(2 * np.pi * date_range.dayofweek / 7)
+
+# Temperature (correlated, seasonal)
+temperature = (
+    25
+    + 10 * np.sin(2 * np.pi * date_range.dayofyear / 365)
+    + np.random.normal(0, 2, n)
+)
+
+# Noise
+noise = np.random.normal(0, 5, n)
+
+# Load (target variable)
+load = (
+    100
+    + trend
+    + daily_seasonality
+    + weekly_seasonality
+    + 0.5 * temperature
+    + noise
+)
+data = pd.DataFrame({
+    "load": load,
+    "temperature": temperature,
+    "hour": date_range.hour
+}, index=date_range)
+
+# Lag feature (previous day load)
+data["load_lag_24"] = data["load"].shift(24)
+
+# Drop initial NaNs
+data.dropna(inplace=True)
+
+data.head()
+plt.plot(data.index[:1000], data["load"][:1000])
+plt.title("Electricity Load (First 1000 Hours)")
+plt.xlabel("Time")
+plt.ylabel("Load")
+plt.grid(True)
+plt.show()
+
+plt.scatter(data["temperature"][:500], data["load"][:500], alpha=0.5)
+plt.title("Load vs Temperature")
+plt.xlabel("Temperature")
+plt.ylabel("Load")
+plt.show()
+
+# 1-hour lag of load
+data['load_lag_1'] = data['load'].shift(1)
+
+# Drop first row created by lag
+data = data.dropna().reset_index(drop=True)
+
+print("Lag feature added successfully.")
+print(data.head())
+
+# =========================
+# STAGE 2 – WALK-FORWARD VALIDATION SETUP
+# =========================
+
+import matplotlib.pyplot as plt
+
+# -------------------------
+# 2.1 Feature–Target Split
+# -------------------------
+
+# Target variable
+y = data['load']
+
+# Feature set (multivariate)
+X = data[['temperature', 'hour', 'load_lag_1']]
+
+# -------------------------
+# 2.2 Initial Train/Test Split (70% / 30%)
+# -------------------------
+
+initial_train_size = 5000
+
+
+X_train_init = X.iloc[:initial_train_size].copy()
+y_train_init = y.iloc[:initial_train_size].copy()
+
+X_test = X.iloc[initial_train_size:].copy()
+y_test = y.iloc[initial_train_size:].copy()
+
+print("Initial training samples:", len(X_train_init))
+print("Testing samples:", len(X_test))
+
+# -------------------------
+# 2.3 Visualization (NO DATA LEAKAGE PROOF)
+# -------------------------
+
+plt.figure(figsize=(14,5))
+plt.plot(y_train_init.index, y_train_init, label="Training Data")
+plt.plot(y_test.index, y_test, label="Testing Data")
+plt.xlabel("Time")
+plt.ylabel("Load")
+plt.title("Walk-Forward Validation: Train / Test Split")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# -------------------------
+# 2.4 Walk-Forward Containers
+# -------------------------
+
+# These will be updated step-by-step during forecasting
+history_X = X_train_init.copy()
+history_y = y_train_init.copy()
+
+print("Walk-forward history initialized.")
+
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.metrics import mean_squared_error
 import numpy as np
 import matplotlib.pyplot as plt
 
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error
+print("STAGE 3 STARTED — SARIMAX BASELINE")
 
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from prophet import Prophet
-
-import tensorflow as tf
-from tensorflow.keras.layers import Input, LSTM, Dense, Attention, GlobalAveragePooling1D
-from tensorflow.keras.models import Model
-
-import keras_tuner as kt
-import shutil
-
-url = "https://raw.githubusercontent.com/jbrownlee/Datasets/master/airline-passengers.csv"
-data = pd.read_csv(url)
-
-data.columns = ["Month", "Passengers"]
-data["Month"] = pd.to_datetime(data["Month"])
-data.set_index("Month", inplace=True)
-
-np.random.seed(42)
-data["Ticket_Price"] = np.linspace(100, 300, len(data)) + np.random.normal(0, 10, len(data))
-data["Fuel_Cost"] = 200 + np.sin(np.arange(len(data)) / 6) * 20
-data["Economic_Index"] = np.random.normal(50, 5, len(data))
-
-data.head()
-
-data.plot(subplots=True, figsize=(10, 8))
-plt.suptitle("Multivariate Time Series Variables")
-plt.show()
-
-scaler = MinMaxScaler()
-scaled_data = scaler.fit_transform(data)
-
-def create_sequences(data, window=12):
-    X, y = [], []
-    for i in range(len(data) - window):
-        X.append(data[i:i+window])
-        y.append(data[i+window, 0])
-    return np.array(X), np.array(y)
-
-WINDOW = 12
-X, y = create_sequences(scaled_data, WINDOW)
-
-X.shape, y.shape
-
-def rolling_origin_split(X, y, n_splits=3):
-    split_size = len(X) // (n_splits + 1)
-    splits = []
-    for i in range(n_splits):
-        end = split_size * (i + 1)
-        splits.append((X[:end], X[end:end+split_size], y[:end], y[end:end+split_size]))
-    return splits
-
-splits = rolling_origin_split(X, y)
-
-train_size = int(len(data) * 0.8)
-train, test = data.iloc[:train_size], data.iloc[train_size:]
-
-sarima = SARIMAX(train["Passengers"], order=(1,1,1), seasonal_order=(1,1,1,12))
-sarima_fit = sarima.fit(disp=False)
-
-sarima_pred = sarima_fit.forecast(len(test))
-sarima_rmse = np.sqrt(mean_squared_error(test["Passengers"], sarima_pred))
-
-sarima_rmse
-
-prophet_df = data.reset_index()[["Month", "Passengers"]]
-prophet_df.columns = ["ds", "y"]
-
-prophet_model = Prophet()
-prophet_model.fit(prophet_df.iloc[:train_size])
-
-future = prophet_model.make_future_dataframe(periods=len(test), freq="MS")
-forecast = prophet_model.predict(future)
-
-prophet_pred = forecast["yhat"].iloc[-len(test):].values
-prophet_rmse = np.sqrt(mean_squared_error(test["Passengers"], prophet_pred))
-
-prophet_rmse
-
-def build_attention_model(units=64):
-    inputs = Input(shape=(WINDOW, X.shape[2]))
-    lstm_out = LSTM(units, return_sequences=True)(inputs)
-    attention_out = Attention()([lstm_out, lstm_out])
-    context = GlobalAveragePooling1D()(attention_out)
-    output = Dense(1)(context)
-
-    model = Model(inputs, output)
-    model.compile(optimizer="adam", loss="mse")
-    return model
-
-shutil.rmtree("tuner", ignore_errors=True)
-
-def tuner_model(hp):
-    units = hp.Int("units", 32, 128, step=32)
-    return build_attention_model(units)
-
-tuner = kt.RandomSearch(
-    tuner_model,
-    objective="val_loss",
-    max_trials=5,
-    directory="tuner",
-    project_name="attention_ts"
+# -------------------------
+# Train SARIMAX ONCE
+# -------------------------
+sarima_model = SARIMAX(
+    y_train_init,
+    exog=X_train_init,
+    order=(1, 1, 1),
+    seasonal_order=(1, 1, 1, 24),
+    enforce_stationarity=False,
+    enforce_invertibility=False
 )
 
-X_train, X_test, y_train, y_test = splits[0]
+sarima_fit = sarima_model.fit(disp=False)
 
-tuner.search(
-    X_train,
-    y_train,
-    validation_data=(X_test, y_test),
-    epochs=10,
-    verbose=1
+print("Model training completed")
+
+# -------------------------
+# Forecast on test set
+# -------------------------
+sarima_forecast = sarima_fit.forecast(
+    steps=len(y_test),
+    exog=X_test
 )
 
-best_model = tuner.get_best_models(1)[0]
-lstm_rmse = np.sqrt(best_model.evaluate(X_test, y_test))
-lstm_rmse
+# -------------------------
+# Evaluation
+# -------------------------
+rmse = np.sqrt(mean_squared_error(y_test, sarima_forecast))
+print("SARIMAX RMSE:", rmse)
 
-lstm_pred = best_model.predict(X_test)
-
-pmin = scaler.data_min_[0]
-pmax = scaler.data_max_[0]
-
-y_test_actual = y_test * (pmax - pmin) + pmin
-y_pred_actual = lstm_pred.flatten() * (pmax - pmin) + pmin
-
-plt.figure(figsize=(10,4))
-plt.plot(y_test_actual, label="Actual")
-plt.plot(y_pred_actual, label="Predicted")
-plt.title("Actual vs Predicted Passenger Count (LSTM + Attention)")
+# -------------------------
+# Plot
+# -------------------------
+plt.figure(figsize=(12,5))
+plt.plot(y_test.values[:200], label="Actual", linewidth=2)
+plt.plot(sarima_forecast.values[:200], label="SARIMAX Forecast", linestyle="--")
+plt.title("SARIMAX Baseline Forecast vs Actual")
+plt.xlabel("Time Steps")
+plt.ylabel("Load")
 plt.legend()
 plt.show()
 
-attention_model = Model(
-    inputs=best_model.input,
-    outputs=best_model.layers[2].output
+print("STAGE 3 COMPLETED SUCCESSFULLY")
+
+# =========================
+# STAGE 4: FOREST MODEL
+# =========================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+# Target variable
+y = data['load']
+
+# Multivariate feature set
+X = data[['temperature', 'hour', 'load_lag_1']]
+train_size = int(len(data) * 0.7)
+
+X_train = X.iloc[:train_size]
+y_train = y.iloc[:train_size]
+
+X_test = X.iloc[train_size:]
+y_test = y.iloc[train_size:]
+
+print("Train size:", len(X_train))
+print("Test size :", len(X_test))
+rf_model = RandomForestRegressor(
+    n_estimators=200,
+    max_depth=10,
+    random_state=42,
+    n_jobs=-1
 )
 
-attention_weights = attention_model.predict(X_test[:1])
+rf_model.fit(X_train, y_train)
+rf_predictions = rf_model.predict(X_test)
 
-plt.figure(figsize=(6,4))
-plt.imshow(attention_weights[0], aspect="auto")
-plt.colorbar()
-plt.title("Attention Weight Heatmap")
-plt.xlabel("Features")
-plt.ylabel("Time Steps")
+rmse_rf = np.sqrt(mean_squared_error(y_test, rf_predictions))
+mae_rf = mean_absolute_error(y_test, rf_predictions)
+
+print("Random Forest RMSE:", rmse_rf)
+print("Random Forest MAE :", mae_rf)
+plt.figure(figsize=(12,5))
+plt.plot(y_test.values[:200], label="Actual Load", linewidth=2)
+plt.plot(rf_predictions[:200], label="RF Forecast", linestyle="--")
+plt.title("Random Forest Forecast vs Actual (First 200 Points)")
+plt.xlabel("Time Step")
+plt.ylabel("Electricity Load")
+plt.legend()
+plt.grid(True)
 plt.show()
 
-results = pd.DataFrame({
-    "Model": ["SARIMA", "Prophet", "LSTM + Attention"],
-    "RMSE": [sarima_rmse, prophet_rmse, lstm_rmse]
-})
+# =========================
+# STAGE 5: SHAP EXPLAINABILITY
+# =========================
 
-results
+import shap
+import matplotlib.pyplot as plt
 
-plt.figure(figsize=(6,4))
-plt.bar(results["Model"], results["RMSE"])
-plt.title("Model Performance Comparison (RMSE)")
-plt.ylabel("RMSE")
+# 1️⃣ Initialize SHAP (safe for Jupyter)
+shap.initjs()
+
+# 2️⃣ Create SHAP explainer for Random Forest
+explainer = shap.TreeExplainer(rf_model)
+
+# 3️⃣ Calculate SHAP values on test data
+shap_values = explainer.shap_values(X_test)
+
+# =========================
+# 4️⃣ SHAP SUMMARY PLOT
+# =========================
+print("SHAP Summary Plot (Feature Importance)")
+shap.summary_plot(
+    shap_values,
+    X_test,
+    feature_names=X_test.columns,
+    show=True
+)
+
+# =========================
+# 5️⃣ SHAP BAR PLOT
+# =========================
+print("SHAP Bar Plot (Mean Absolute Impact)")
+shap.summary_plot(
+    shap_values,
+    X_test,
+    feature_names=X_test.columns,
+    plot_type="bar",
+    show=True
+)
+
+# =========================
+# 6️⃣ SINGLE PREDICTION EXPLANATION
+# =========================
+sample_index = 0
+
+print("SHAP Force Plot for one prediction")
+shap.force_plot(
+    explainer.expected_value,
+    shap_values[sample_index],
+    X_test.iloc[sample_index],
+    matplotlib=True
+)
+
 plt.show()
-
